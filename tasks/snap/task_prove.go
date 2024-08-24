@@ -15,10 +15,12 @@ import (
 	"github.com/filecoin-project/curio/lib/ffi"
 	"github.com/filecoin-project/curio/lib/passcall"
 	"github.com/filecoin-project/curio/tasks/seal"
+	"github.com/filecoin-project/curio/tasks/window" // Importing the window package for DeadlineInfo and ComputeCurrentDeadline
 
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
+// ProveTask is the task structure
 type ProveTask struct {
 	max int
 
@@ -27,6 +29,7 @@ type ProveTask struct {
 	paramsReady func() (bool, error)
 }
 
+// NewProveTask creates a new ProveTask
 func NewProveTask(sc *ffi.SealCalls, db *harmonydb.DB, paramck func() (bool, error), max int) *ProveTask {
 	return &ProveTask{
 		max: max,
@@ -38,14 +41,14 @@ func NewProveTask(sc *ffi.SealCalls, db *harmonydb.DB, paramck func() (bool, err
 	}
 }
 
+// Do performs the ProveTask
 func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	var tasks []struct {
 		SpID         int64 `db:"sp_id"`
 		SectorNumber int64 `db:"sector_number"`
 		UpdateProof  int64 `db:"upgrade_proof"`
 
-		RegSealProof int64 `db:"reg_seal_proof"`
-
+		RegSealProof int64  `db:"reg_seal_proof"`
 		OrigSealedCID     string `db:"orig_sealed_cid"`
 		UpdateSealedCID   string `db:"update_sealed_cid"`
 		UpdateUnsealedCID string `db:"update_unsealed_cid"`
@@ -79,7 +82,6 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 	cidSealed, err := cid.Parse(sectorParams.UpdateSealedCID)
 	if err != nil {
 		return false, xerrors.Errorf("parsing update sealed cid: %w", err)
-
 	}
 
 	sector := storiface.SectorRef{
@@ -103,6 +105,7 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 	return true, nil
 }
 
+// CanAccept checks if the task can be accepted
 func (p *ProveTask) CanAccept(ids []harmonytask.TaskID, engine *harmonytask.TaskEngine) (*harmonytask.TaskID, error) {
 	rdy, err := p.paramsReady()
 	if err != nil {
@@ -117,6 +120,7 @@ func (p *ProveTask) CanAccept(ids []harmonytask.TaskID, engine *harmonytask.Task
 	return &id, nil
 }
 
+// TypeDetails returns the type details of the task
 func (p *ProveTask) TypeDetails() harmonytask.TaskTypeDetails {
 	gpu := 1.0
 	if seal.IsDevnet {
@@ -137,6 +141,7 @@ func (p *ProveTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 }
 
+// schedule tasks for proving sectors
 func (p *ProveTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
 	var stop bool
 	for !stop {
@@ -160,6 +165,19 @@ func (p *ProveTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFu
 			// pick at random in case there are a bunch of schedules across the cluster
 			t := tasks[rand.N(len(tasks))]
 
+			// Get the current deadline for the sector using the imported window package
+			currentDeadline, err := window.ComputeCurrentDeadline(ctx, t.SpID, t.SectorNumber)
+
+			if err != nil {
+				return false, xerrors.Errorf("failed to get current deadline: %w", err)
+			}
+
+			// Check if the sector is in an immutable deadline period
+			if IsImmutableDeadline(uint64(t.SectorNumber), currentDeadline) {
+				log.Infof("Skipping sector %d as it is in an immutable deadline period", t.SectorNumber)
+				return false, nil // Skip this sector and stop further processing
+			}
+
 			_, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_prove = $1 WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
 			if err != nil {
 				return false, xerrors.Errorf("updating task id: %w", err)
@@ -173,9 +191,11 @@ func (p *ProveTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFu
 	return nil
 }
 
+// Adder adds tasks to the ProveTask
 func (p *ProveTask) Adder(taskFunc harmonytask.AddTaskFunc) {
 }
 
+// GetSpid gets the storage provider ID for a task
 func (p *ProveTask) GetSpid(db *harmonydb.DB, taskID int64) string {
 	sid, err := p.GetSectorID(db, taskID)
 	if err != nil {
@@ -185,6 +205,7 @@ func (p *ProveTask) GetSpid(db *harmonydb.DB, taskID int64) string {
 	return sid.Miner.String()
 }
 
+// GetSectorID retrieves the sector ID for a task
 func (p *ProveTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {
 	var spId, sectorNumber uint64
 	err := db.QueryRow(context.Background(), `SELECT sp_id,sector_number FROM sectors_snap_pipeline WHERE task_id_prove = $1`, taskID).Scan(&spId, &sectorNumber)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"github.com/filecoin-project/curio/tasks/window"
 
 	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
@@ -94,6 +95,22 @@ func NewSubmitTask(db *harmonydb.DB, api SubmitTaskNodeAPI, bstore curiochain.Cu
 			RequireNotificationSuccess: cfg.Subsystems.RequireNotificationSuccess,
 		},
 	}
+}
+
+
+// GetSectorDeadline retrieves the deadline information for a specific sector
+func GetSectorDeadline(spID int64, sectorNumber int64) (window.DeadlineInfo, error) {
+    ctx := context.Background()
+    deadlineInfo, err := window.ComputeCurrentDeadline(ctx, spID, sectorNumber)
+    if err != nil {
+        return window.DeadlineInfo{}, xerrors.Errorf("failed to fetch deadline info: %w", err)
+    }
+    return deadlineInfo, nil
+}
+
+// IsImmutableDeadline checks if the given deadline is currently in an immutable state
+func IsImmutableDeadline(sectorDeadline uint64, currentDeadline window.DeadlineInfo) bool {
+    return sectorDeadline == currentDeadline.Index
 }
 
 func (s *SubmitTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {

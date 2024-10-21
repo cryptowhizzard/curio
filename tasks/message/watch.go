@@ -149,10 +149,10 @@ func (mw *MessageWatcher) update() {
 		}
 
 		look, err := mw.api.StateSearchMsg(ctx, lbtsk, cid.MustParse(msg.Cid), api.LookbackNoLimit, true)
-		if err != nil {
-			log.Errorf("failed to search for message: %+v", err)
-			continue
-		}
+		//if err != nil {
+		//	log.Errorf("failed to search for message: %+v", err)
+		//	continue
+		//}
 
 		if look == nil {
 			continue // not on chain yet (or not executed yet)

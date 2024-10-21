@@ -2,6 +2,10 @@ package webrpc
 
 import (
 	"context"
+	//"log"
+        //logging "github.com/ipfs/go-log/v2"
+
+	"time"
 
 	"golang.org/x/xerrors"
 
@@ -49,7 +53,6 @@ func (a *WebRPC) UpgradeResetTaskIDs(ctx context.Context, spid, sectorNum int64)
 
 func (a *WebRPC) UpgradeDelete(ctx context.Context, spid, sectorNum uint64) error {
 	if err := snap.DropSectorPieceRefsSnap(ctx, a.deps.DB, abi.SectorID{Miner: abi.ActorID(spid), Number: abi.SectorNumber(sectorNum)}); err != nil {
-		// bad, but still do best we can and continue
 		log.Errorw("failed to drop sector piece refs", "error", err)
 	}
 
@@ -138,4 +141,23 @@ func (a *WebRPC) PipelineSnapRestartAll(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// Scheduler to run PipelineSnapRestartAll every hour
+func (a *WebRPC) schedulePipelineSnapRestart() {
+	go func() {
+		for {
+			err := a.PipelineSnapRestartAll(context.Background())
+			if err != nil {
+				//log.Println("Error restarting Snap pipeline:", err)
+			}
+			time.Sleep(1 * time.Hour) // Sleep for 1 hour before the next restart
+		}
+	}()
+}
+
+// Add an init method to start the scheduling automatically
+func (a *WebRPC) Init() {
+	// Start the scheduler on initialization
+	a.schedulePipelineSnapRestart()
 }

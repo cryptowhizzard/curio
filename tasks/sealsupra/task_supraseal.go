@@ -160,24 +160,33 @@ func NewSupraSeal(sectorSize string, batchSize, pipelines int, dualHashers bool,
 }
 
 func (s *SupraSeal) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
+    ctx := context.Background()
 
-	var sectors []struct {
-		SpID         int64 `db:"sp_id"`
-		SectorNumber int64 `db:"sector_number"`
+    // Add logging for taskID and function entry
+    log.Info("Starting SupraSeal task", "taskID", taskID)
 
-		RegSealProof int64 `db:"reg_seal_proof"`
-	}
+    var sectors []struct {
+        SpID         int64 `db:"sp_id"`
+        SectorNumber int64 `db:"sector_number"`
+        RegSealProof int64 `db:"reg_seal_proof"`
+    }
 
-	err = s.db.Select(ctx, &sectors, `SELECT sp_id, sector_number, reg_seal_proof FROM sectors_sdr_pipeline WHERE task_id_sdr = $1 AND task_id_tree_r = $1 AND task_id_tree_c = $1 AND task_id_tree_d = $1`, taskID)
-	if err != nil {
-		return false, xerrors.Errorf("getting sector params: %w", err)
-	}
+    err = s.db.Select(ctx, &sectors, `SELECT sp_id, sector_number, reg_seal_proof FROM sectors_sdr_pipeline WHERE task_id_sdr = $1 AND task_id_tree_r = $1 AND task_id_tree_c = $1 AND task_id_tree_d = $1`, taskID)
+    
+    // Log any database query error
+    if err != nil {
+        log.Error("Error fetching sectors from database", "taskID", taskID, "error", err)
+        return false, xerrors.Errorf("Error fetching sectors from database: %w", err)
+    }
 
-	if len(sectors) != s.sectors {
-		return false, xerrors.Errorf("not enough sectors to fill a batch")
-	}
+    // Log the number of sectors retrieved
+    log.Info("Retrieved sectors", "taskID", taskID, "sectors_count", len(sectors))
 
+    // Check if the number of sectors matches the expected batch size
+    if len(sectors) != s.sectors {
+        log.Error("Not enough sectors to fill a batch", "expected_sectors", s.sectors, "retrieved_sectors", len(sectors))
+        return false, xerrors.Errorf("not enough sectors to fill a batch")
+    }
 	ssize, err := s.spt.SectorSize()
 	if err != nil {
 		return false, err

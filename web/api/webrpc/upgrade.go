@@ -2,9 +2,6 @@ package webrpc
 
 import (
 	"context"
-	//"log"
-        //logging "github.com/ipfs/go-log/v2"
-
 	"time"
 
 	"golang.org/x/xerrors"
@@ -149,7 +146,7 @@ func (a *WebRPC) schedulePipelineSnapRestart() {
 		for {
 			err := a.PipelineSnapRestartAll(context.Background())
 			if err != nil {
-				//log.Println("Error restarting Snap pipeline:", err)
+				log.Infow("Error restarting Snap pipeline:", err)
 			}
 			time.Sleep(1 * time.Hour) // Sleep for 1 hour before the next restart
 		}

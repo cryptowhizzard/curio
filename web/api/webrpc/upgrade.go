@@ -6,6 +6,7 @@ import (
 
 	"golang.org/x/xerrors"
 
+	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/tasks/snap"
@@ -32,6 +33,8 @@ type UpgradeSector struct {
 	Failed       bool   `db:"failed"`
 	FailedReason string `db:"failed_reason"`
 	FailedMsg    string `db:"failed_reason_msg"`
+
+	Miner string
 }
 
 func (a *WebRPC) UpgradeSectors(ctx context.Context) ([]UpgradeSector, error) {
@@ -40,6 +43,15 @@ func (a *WebRPC) UpgradeSectors(ctx context.Context) ([]UpgradeSector, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	for _, s := range sectors {
+		maddr, err := address.NewIDAddress(s.SpID)
+		if err != nil {
+			return nil, err
+		}
+		s.Miner = maddr.String()
+	}
+
 	return sectors, nil
 }
 

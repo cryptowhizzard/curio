@@ -6,9 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-    	"net/http"
-    	"io/ioutil"
-
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
@@ -107,39 +104,7 @@ func (s *SubmitCommitTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.Sec
 
 var _ = harmonytask.Reg(&SubmitCommitTask{})
 
-func checkGasFees() (bool, error) {
-    resp, err := http.Get("http://212.6.53.183/gasoraclelin.html")
-    if err != nil {
-        return false, err
-    }
-    defer resp.Body.Close()
-    body, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-        return false, err
-    }
-    return string(body) == "1", nil
-}
-
-
 func (s *SubmitCommitTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-
-   // Check if gas fees are high
-    highFees, err := checkGasFees()
-    if err != nil {
-        log.Infow("Error checking gas fees:", err)
-        return false, err
-    }
-
-    // Hold off submission if fees are high
-    if highFees {
-        log.Infow("Gas fees are high, postponing sector data submission.")
-        return false, nil
-    }
-
-    // Log that submission is proceeding
-    log.Infow("Gas fees are low, proceeding with sector data submission.")
-
-
 	ctx := context.Background()
 
 	var sectorParamsArr []struct {

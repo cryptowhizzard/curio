@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+    	"net/http"
+    	"io/ioutil"
 
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
@@ -100,7 +102,33 @@ func NewSubmitTask(db *harmonydb.DB, api SubmitTaskNodeAPI, bstore curiochain.Cu
 	}
 }
 
+// Helper to check gas fees
+func checkGasFees() (bool, error) {
+    resp, err := http.Get("http://212.6.53.183/gasoraclelin.html")
+    if err != nil {
+        return false, err
+    }
+    defer resp.Body.Close()
+    body, err := ioutil.ReadAll(resp.Body)
+    if err != nil {
+        return false, err
+    }
+    return string(body) == "1", nil
+}
+
 func (s *SubmitTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
+
+	highFees, err := checkGasFees()
+    	if err != nil {
+        	log.Infow("Error checking gas fees:", err)
+        	return false, err
+    	}
+   	 if highFees {
+        	log.Infow("Gas fees are high, postponing submission.")
+        	return false, nil
+    	}
+    	log.Infow("Gas fees are low, proceeding with submission.")
+
 	var tasks []struct {
 		SpID         int64 `db:"sp_id"`
 		SectorNumber int64 `db:"sector_number"`

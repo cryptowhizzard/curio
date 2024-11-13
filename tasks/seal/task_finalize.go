@@ -61,87 +61,126 @@ func (f *FinalizeTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorI
 var _ = harmonytask.Reg(&FinalizeTask{})
 
 func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-    var tasks []struct {
-        SpID         int64 `db:"sp_id"`
-        SectorNumber int64 `db:"sector_number"`
-        RegSealProof int64 `db:"reg_seal_proof"`
-    }
+	var tasks []struct {
+		SpID         int64 `db:"sp_id"`
+		SectorNumber int64 `db:"sector_number"`
+		RegSealProof int64 `db:"reg_seal_proof"`
+	}
 
-    ctx := context.Background()
+	ctx := context.Background()
 
-    err = f.db.Select(ctx, &tasks, `
-        SELECT sp_id, sector_number, reg_seal_proof FROM sectors_sdr_pipeline WHERE task_id_finalize = $1`, taskID)
-    if err != nil {
-        return false, xerrors.Errorf("getting task: %w", err)
-    }
+	err = f.db.Select(ctx, &tasks, `
+		SELECT sp_id, sector_number, reg_seal_proof FROM sectors_sdr_pipeline WHERE task_id_finalize = $1`, taskID)
+	if err != nil {
+		return false, xerrors.Errorf("getting task: %w", err)
+	}
 
-    if len(tasks) != 1 {
-        return false, xerrors.Errorf("expected one task")
-    }
-    task := tasks[0]
+	if len(tasks) != 1 {
+		return false, xerrors.Errorf("expected one task")
+	}
+	task := tasks[0]
 
-    var keepUnsealed bool
+	var keepUnsealed bool
 
-    if err := f.db.QueryRow(ctx, `SELECT COALESCE(BOOL_OR(NOT data_delete_on_finalize), FALSE) FROM sectors_sdr_initial_pieces WHERE sp_id = $1 AND sector_number = $2`, task.SpID, task.SectorNumber).Scan(&keepUnsealed); err != nil {
-        return false, err
-    }
+	if err := f.db.QueryRow(ctx, `SELECT COALESCE(BOOL_OR(NOT data_delete_on_finalize), FALSE) FROM sectors_sdr_initial_pieces WHERE sp_id = $1 AND sector_number = $2`, task.SpID, task.SectorNumber).Scan(&keepUnsealed); err != nil {
+		return false, err
+	}
 
-    sector := storiface.SectorRef{
-        ID: abi.SectorID{
-            Miner:  abi.ActorID(task.SpID),
-            Number: abi.SectorNumber(task.SectorNumber),
-        },
-        ProofType: abi.RegisteredSealProof(task.RegSealProof),
-    }
+	sector := storiface.SectorRef{
+		ID: abi.SectorID{
+			Miner:  abi.ActorID(task.SpID),
+			Number: abi.SectorNumber(task.SectorNumber),
+		},
+		ProofType: abi.RegisteredSealProof(task.RegSealProof),
+	}
 
-    var ownedBy []struct {
-        HostAndPort string `db:"host_and_port"`
-    }
-    var refs []struct {
-        PipelineSlot int64 `db:"pipeline_slot"`
-    }
+	var ownedBy []struct {
+		HostAndPort string `db:"host_and_port"`
+	}
+	var refs []struct {
+		PipelineSlot int64 `db:"pipeline_slot"`
+	}
 
-    if f.slots != nil {
-        // batch handling part 1:
-        // get machine id
+	if f.slots != nil {
+		// batch handling part 1:
+		// get machine id
+		err = f.db.Select(ctx, &ownedBy, `SELECT hm.host_and_port as host_and_port FROM harmony_task INNER JOIN harmony_machines hm on harmony_task.owner_id = hm.id WHERE harmony_task.id = $1`, taskID)
+		if err != nil {
+			return false, xerrors.Errorf("getting machine id: %w", err)
+		}
 
-        err = f.db.Select(ctx, &ownedBy, `SELECT hm.host_and_port as host_and_port FROM harmony_task INNER JOIN harmony_machines hm on harmony_task.owner_id = hm.id WHERE harmony_task.id = $1`, taskID)
-        if err != nil {
-            return false, xerrors.Errorf("getting machine id: %w", err)
-        }
+		if len(ownedBy) != 1 {
+			return false, xerrors.Errorf("expected one machine")
+		}
 
-        if len(ownedBy) != 1 {
-            return false, xerrors.Errorf("expected one machine")
-        }
+		err = f.db.Select(ctx, &refs, `SELECT pipeline_slot FROM batch_sector_refs WHERE sp_id = $1 AND sector_number = $2 AND machine_host_and_port = $3`, task.SpID, task.SectorNumber, ownedBy[0].HostAndPort)
+		if err != nil {
+			return false, xerrors.Errorf("getting batch refs: %w", err)
+		}
 
-        err = f.db.Select(ctx, &refs, `SELECT pipeline_slot FROM batch_sector_refs WHERE sp_id = $1 AND sector_number = $2 AND machine_host_and_port = $3`, task.SpID, task.SectorNumber, ownedBy[0].HostAndPort)
-        if err != nil {
-            return false, xerrors.Errorf("getting batch refs: %w", err)
-        }
+		if len(refs) != 1 {
+			return false, xerrors.Errorf("expected one batch ref")
+		}
+	}
 
-        // **Loop through all refs (slots) for multiple slot handling**
-        for _, ref := range refs {
-            go f.startPeriodicBatchCheck(ctx, ownedBy[0].HostAndPort, ref.PipelineSlot)
-        }
-    }
+	err = f.sc.FinalizeSector(ctx, sector, keepUnsealed)
+	if err != nil {
+		return false, xerrors.Errorf("finalizing sector: %w", err)
+	}
 
-    // Finalize the sector and update database as needed (no changes to this part)
-    err = f.sc.FinalizeSector(ctx, sector, keepUnsealed)
-    if err != nil {
-        return false, xerrors.Errorf("finalizing sector: %w", err)
-    }
+	if err := DropSectorPieceRefs(ctx, f.db, sector.ID); err != nil {
+		return false, xerrors.Errorf("dropping sector piece refs: %w", err)
+	}
 
-    if err := DropSectorPieceRefs(ctx, f.db, sector.ID); err != nil {
-        return false, xerrors.Errorf("dropping sector piece refs: %w", err)
-    }
+	if f.slots != nil {
+		// batch handling part 2:
 
-    // Set after_finalize
-    _, err = f.db.Exec(ctx, `UPDATE sectors_sdr_pipeline SET after_finalize = TRUE, task_id_finalize = NULL WHERE task_id_finalize = $1`, taskID)
-    if err != nil {
-        return false, xerrors.Errorf("updating task: %w", err)
-    }
+		// delete from batch_sector_refs
+		var freeSlot bool
 
-    return true, nil
+		_, err = f.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
+			_, err = tx.Exec(`DELETE FROM batch_sector_refs WHERE sp_id = $1 AND sector_number = $2`, task.SpID, task.SectorNumber)
+			if err != nil {
+				return false, xerrors.Errorf("deleting batch refs: %w", err)
+			}
+
+			// get sector ref count, if zero free the pipeline slot
+			var count int64
+			err = tx.QueryRow(`SELECT COUNT(1) as count FROM batch_sector_refs WHERE machine_host_and_port = $1 AND pipeline_slot = $2`, ownedBy[0].HostAndPort, refs[0].PipelineSlot).Scan(&count)
+			if err != nil {
+				return false, xerrors.Errorf("getting batch ref count: %w", err)
+			}
+
+			if count == 0 {
+				freeSlot = true
+			} else {
+				log.Infow("Not freeing batch slot", "slot", refs[0].PipelineSlot, "machine", ownedBy[0].HostAndPort, "remaining", count)
+			}
+
+			return true, nil
+		}, harmonydb.OptionRetry())
+		if err != nil {
+			return false, xerrors.Errorf("deleting batch refs: %w", err)
+		}
+
+		if freeSlot {
+			log.Infow("Freeing batch slot", "slot", refs[0].PipelineSlot, "machine", ownedBy[0].HostAndPort)
+			if err := f.slots.Put(uint64(refs[0].PipelineSlot)); err != nil {
+				return false, xerrors.Errorf("freeing slot: %w", err)
+			}
+		}
+
+		// Start periodic check to free batch slots if no sectors are waiting
+		go f.startPeriodicBatchCheck(ctx, ownedBy[0].HostAndPort, refs[0].PipelineSlot)
+	}
+
+	// set after_finalize
+	_, err = f.db.Exec(ctx, `UPDATE sectors_sdr_pipeline SET after_finalize = TRUE, task_id_finalize = NULL WHERE task_id_finalize = $1`, taskID)
+	if err != nil {
+		return false, xerrors.Errorf("updating task: %w", err)
+	}
+
+	return true, nil
 }
 
 // New function for periodic batch check with additional debugging logs
@@ -189,7 +228,7 @@ func (f *FinalizeTask) checkAndFreeBatchSlot(ctx context.Context, hostAndPort st
 	if count == 0 {
 		log.Infow("No sectors remaining, freeing batch slot", "slot", pipelineSlot, "machine", hostAndPort)
 		if err := f.slots.Put(uint64(pipelineSlot)); err != nil {
-			log.Errorw("Error freeing slot", "slot", pipelineSlot, "error", err)
+			log.Errorw("Error freeing slot", "slot", pipelineSlot, "error", err) // This will give some log spam as you can't keep deleting slots who are already deleted.
 		} else {
 			log.Infow("Successfully freed batch slot", "slot", pipelineSlot)
 		}

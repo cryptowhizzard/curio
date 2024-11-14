@@ -2,6 +2,7 @@ package seal
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -17,26 +18,30 @@ import (
 )
 
 type FinalizeTask struct {
-	max int
-	sp  *SealPoller
-	sc  *ffi.SealCalls
-	db  *harmonydb.DB
-
-	// Batch, nillable!
-	slots *slotmgr.SlotMgr
+	max    int
+	sp     *SealPoller
+	sc     *ffi.SealCalls
+	db     *harmonydb.DB
+	slots  *slotmgr.SlotMgr
+	slotMu sync.Mutex // Mutex for slot management
 }
 
+// NewFinalizeTask creates a new FinalizeTask instance and initiates periodic checks
 func NewFinalizeTask(max int, sp *SealPoller, sc *ffi.SealCalls, db *harmonydb.DB, slots *slotmgr.SlotMgr) *FinalizeTask {
-	return &FinalizeTask{
-		max: max,
-		sp:  sp,
-		sc:  sc,
-		db:  db,
-
+	task := &FinalizeTask{
+		max:   max,
+		sp:    sp,
+		sc:    sc,
+		db:    db,
 		slots: slots,
 	}
+
+	// Start the periodic batch check once on task creation
+	go task.startGlobalPeriodicBatchCheck(context.Background())
+	return task
 }
 
+// GetSpid retrieves the sector ID for a given task ID
 func (f *FinalizeTask) GetSpid(db *harmonydb.DB, taskID int64) string {
 	sid, err := f.GetSectorID(db, taskID)
 	if err != nil {
@@ -46,6 +51,7 @@ func (f *FinalizeTask) GetSpid(db *harmonydb.DB, taskID int64) string {
 	return sid.Miner.String()
 }
 
+// GetSectorID fetches the sector ID from the database
 func (f *FinalizeTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {
 	var spId, sectorNumber uint64
 	err := db.QueryRow(context.Background(), `SELECT sp_id,sector_number FROM sectors_sdr_pipeline WHERE task_id_finalize = $1`, taskID).Scan(&spId, &sectorNumber)
@@ -60,6 +66,7 @@ func (f *FinalizeTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorI
 
 var _ = harmonytask.Reg(&FinalizeTask{})
 
+// Do finalizes the given task and manages slots
 func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	var tasks []struct {
 		SpID         int64 `db:"sp_id"`
@@ -69,8 +76,7 @@ func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (do
 
 	ctx := context.Background()
 
-	err = f.db.Select(ctx, &tasks, `
-		SELECT sp_id, sector_number, reg_seal_proof FROM sectors_sdr_pipeline WHERE task_id_finalize = $1`, taskID)
+	err = f.db.Select(ctx, &tasks, `SELECT sp_id, sector_number, reg_seal_proof FROM sectors_sdr_pipeline WHERE task_id_finalize = $1`, taskID)
 	if err != nil {
 		return false, xerrors.Errorf("getting task: %w", err)
 	}
@@ -132,6 +138,10 @@ func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (do
 		return false, xerrors.Errorf("dropping sector piece refs: %w", err)
 	}
 
+	// Lock slot management to prevent race conditions
+	f.slotMu.Lock()
+	defer f.slotMu.Unlock()
+
 	if f.slots != nil {
 		// batch handling part 2:
 
@@ -169,9 +179,6 @@ func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (do
 				return false, xerrors.Errorf("freeing slot: %w", err)
 			}
 		}
-
-		// Start periodic check to free batch slots if no sectors are waiting
-		go f.startPeriodicBatchCheck(ctx, ownedBy[0].HostAndPort, refs[0].PipelineSlot)
 	}
 
 	// set after_finalize
@@ -183,57 +190,54 @@ func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (do
 	return true, nil
 }
 
-// New function for periodic batch check with additional debugging logs
-func (f *FinalizeTask) startPeriodicBatchCheck(ctx context.Context, hostAndPort string, pipelineSlot int64) {
-	log.Infow("Starting periodic batch check", "host", hostAndPort, "slot", pipelineSlot)
+// Global periodic batch check running independently for all slots
+func (f *FinalizeTask) startGlobalPeriodicBatchCheck(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Infow("Context canceled, stopping periodic batch check", "host", hostAndPort, "slot", pipelineSlot)
 			return
 		case <-ticker.C:
-			log.Infow("Running periodic check and logging pipeline status", "host", hostAndPort, "slot", pipelineSlot)
-			f.checkAndLogPipelineStatus(ctx, hostAndPort, pipelineSlot)
-			f.checkAndFreeBatchSlot(ctx, hostAndPort, pipelineSlot)
+			f.slotMu.Lock()
+			// Check all slots and free them if no sectors are waiting
+			f.checkAndFreeUnusedSlots(ctx)
+			f.slotMu.Unlock()
 		}
 	}
 }
 
-// New function to log the current pipeline status with additional debugging
-func (f *FinalizeTask) checkAndLogPipelineStatus(ctx context.Context, hostAndPort string, pipelineSlot int64) {
-	log.Infow("Checking pipeline status", "host", hostAndPort, "slot", pipelineSlot)
-	var count int64
-	err := f.db.QueryRow(ctx, `SELECT COUNT(1) as count FROM batch_sector_refs WHERE machine_host_and_port = $1 AND pipeline_slot = $2`, hostAndPort, pipelineSlot).Scan(&count)
+// Check and free unused slots if no sectors are pending
+func (f *FinalizeTask) checkAndFreeUnusedSlots(ctx context.Context) {
+	// Query all pipeline slots and machines to check if they can be freed
+	var entries []struct {
+		MachineHostAndPort string `db:"machine_host_and_port"`
+		PipelineSlot       int64  `db:"pipeline_slot"`
+		Count              int64  `db:"count"`
+	}
+
+	err := f.db.Select(ctx, &entries, `
+		SELECT machine_host_and_port, pipeline_slot, COUNT(1) as count
+		FROM batch_sector_refs
+		GROUP BY machine_host_and_port, pipeline_slot
+	`)
 	if err != nil {
-		log.Errorw("Error checking batch ref count for logging", "error", err)
+		log.Errorw("Error querying batch sector refs for freeing slots", "error", err)
 		return
 	}
 
-	// Log the current number of sectors in the pipeline and the host they are open on
-	log.Infow("Pipeline status check", "remaining_sectors", count, "host", hostAndPort, "slot", pipelineSlot)
-}
-
-// Existing function to check and free batch slot if no sectors are pending
-func (f *FinalizeTask) checkAndFreeBatchSlot(ctx context.Context, hostAndPort string, pipelineSlot int64) {
-	var count int64
-	err := f.db.QueryRow(ctx, `SELECT COUNT(1) as count FROM batch_sector_refs WHERE machine_host_and_port = $1 AND pipeline_slot = $2`, hostAndPort, pipelineSlot).Scan(&count)
-	if err != nil {
-		log.Errorw("Error checking batch ref count", "error", err)
-		return
-	}
-
-	if count == 0 {
-		log.Infow("No sectors remaining, freeing batch slot", "slot", pipelineSlot, "machine", hostAndPort)
-		if err := f.slots.Put(uint64(pipelineSlot)); err != nil {
-			log.Errorw("Error freeing slot", "slot", pipelineSlot, "error", err) // This will give some log spam as you can't keep deleting slots who are already deleted.
+	for _, entry := range entries {
+		if entry.Count == 0 {
+			// Free the slot if no sectors are waiting
+			if err := f.slots.Put(uint64(entry.PipelineSlot)); err != nil {
+				log.Errorw("Error freeing slot", "slot", entry.PipelineSlot, "error", err)
+			} else {
+				log.Infow("Successfully freed batch slot", "slot", entry.PipelineSlot, "machine", entry.MachineHostAndPort)
+			}
 		} else {
-			log.Infow("Successfully freed batch slot", "slot", pipelineSlot)
+			log.Infow("Sectors still remaining in the batch", "remaining", entry.Count, "machine", entry.MachineHostAndPort, "slot", entry.PipelineSlot)
 		}
-	} else {
-		log.Infow("Sectors still remaining in the batch", "remaining", count)
 	}
 }
 

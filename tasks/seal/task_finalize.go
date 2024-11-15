@@ -18,11 +18,11 @@ import (
 )
 
 type FinalizeTask struct {
-	max    int
-	sp     *SealPoller
-	sc     *ffi.SealCalls
-	db     *harmonydb.DB
-	slots  *slotmgr.SlotMgr
+	max   int
+	sp    *SealPoller
+	sc    *ffi.SealCalls
+	db    *harmonydb.DB
+	slots *slotmgr.SlotMgr
 	slotMu sync.Mutex // Mutex for slot management
 }
 
@@ -54,7 +54,7 @@ func (f *FinalizeTask) GetSpid(db *harmonydb.DB, taskID int64) string {
 // GetSectorID fetches the sector ID from the database
 func (f *FinalizeTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {
 	var spId, sectorNumber uint64
-	err := db.QueryRow(context.Background(), `SELECT sp_id,sector_number FROM sectors_sdr_pipeline WHERE task_id_finalize = $1`, taskID).Scan(&spId, &sectorNumber)
+	err := db.QueryRow(context.Background(), `SELECT sp_id, sector_number FROM sectors_sdr_pipeline WHERE task_id_finalize = $1`, taskID).Scan(&spId, &sectorNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -138,14 +138,10 @@ func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (do
 		return false, xerrors.Errorf("dropping sector piece refs: %w", err)
 	}
 
-	// Lock slot management to prevent race conditions
 	f.slotMu.Lock()
 	defer f.slotMu.Unlock()
 
 	if f.slots != nil {
-		// batch handling part 2:
-
-		// delete from batch_sector_refs
 		var freeSlot bool
 
 		_, err = f.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
@@ -154,7 +150,6 @@ func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (do
 				return false, xerrors.Errorf("deleting batch refs: %w", err)
 			}
 
-			// get sector ref count, if zero free the pipeline slot
 			var count int64
 			err = tx.QueryRow(`SELECT COUNT(1) as count FROM batch_sector_refs WHERE machine_host_and_port = $1 AND pipeline_slot = $2`, ownedBy[0].HostAndPort, refs[0].PipelineSlot).Scan(&count)
 			if err != nil {
@@ -181,7 +176,6 @@ func (f *FinalizeTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (do
 		}
 	}
 
-	// set after_finalize
 	_, err = f.db.Exec(ctx, `UPDATE sectors_sdr_pipeline SET after_finalize = TRUE, task_id_finalize = NULL WHERE task_id_finalize = $1`, taskID)
 	if err != nil {
 		return false, xerrors.Errorf("updating task: %w", err)
@@ -201,7 +195,6 @@ func (f *FinalizeTask) startGlobalPeriodicBatchCheck(ctx context.Context) {
 			return
 		case <-ticker.C:
 			f.slotMu.Lock()
-			// Check all slots and free them if no sectors are waiting
 			f.checkAndFreeUnusedSlots(ctx)
 			f.slotMu.Unlock()
 		}
@@ -210,7 +203,6 @@ func (f *FinalizeTask) startGlobalPeriodicBatchCheck(ctx context.Context) {
 
 // Check and free unused slots if no sectors are pending
 func (f *FinalizeTask) checkAndFreeUnusedSlots(ctx context.Context) {
-	// Query all pipeline slots and machines to check if they can be freed
 	var entries []struct {
 		MachineHostAndPort string `db:"machine_host_and_port"`
 		PipelineSlot       int64  `db:"pipeline_slot"`
@@ -229,7 +221,6 @@ func (f *FinalizeTask) checkAndFreeUnusedSlots(ctx context.Context) {
 
 	for _, entry := range entries {
 		if entry.Count == 0 {
-			// Free the slot if no sectors are waiting
 			if err := f.slots.Put(uint64(entry.PipelineSlot)); err != nil {
 				log.Errorw("Error freeing slot", "slot", entry.PipelineSlot, "error", err)
 			} else {
@@ -262,9 +253,9 @@ func (f *FinalizeTask) CanAccept(ids []harmonytask.TaskID, engine *harmonytask.T
 
 	err := f.db.Select(ctx, &tasks, `
 		SELECT p.task_id_finalize, p.sp_id, p.sector_number, l.storage_id FROM sectors_sdr_pipeline p
-			INNER JOIN sector_location l ON p.sp_id = l.miner_id AND p.sector_number = l.sector_num
-			WHERE task_id_finalize = ANY ($1) AND l.sector_filetype = 4
-`, indIDs)
+		INNER JOIN sector_location l ON p.sp_id = l.miner_id AND p.sector_number = l.sector_num
+		WHERE task_id_finalize = ANY ($1) AND l.sector_filetype = 4
+	`, indIDs)
 	if err != nil {
 		return nil, xerrors.Errorf("getting tasks: %w", err)
 	}

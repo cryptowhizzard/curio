@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"time"
 
 	"net/http"
     	"io/ioutil"
@@ -459,26 +460,33 @@ func checkGasFees() (bool, error) {
     if err != nil {
         return false, err
     }
-    return string(body) == "0", nil
+    // Return true if gas fees are low (1 means proceed, 0 means hold off)
+    return string(body) == "1", nil
 }
 
 func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
     var stop bool
+    var lastLogTime time.Time // Tracks the last log time
+
     for !stop {
         // Check gas fees before scheduling
-        highFees, err := checkGasFees()
+        proceed, err := checkGasFees()
         if err != nil {
-            log.Infow("Error checking gas fees:", err)
-            // Optionally, handle the error but continue scheduling attempt
+            log.Infow("Error checking gas fees:", "error", err)
+            continue // Optionally continue attempting scheduling
         }
 
-        if highFees {
-            log.Infow("Gas fees are high, skipping scheduling for now.")
+        if !proceed {
+            // Log only if a minute has passed since the last log
+            if time.Since(lastLogTime) > time.Minute {
+                log.Infow("Gas fees are low, holding off scheduling.")
+                lastLogTime = time.Now() // Update the last log time
+            }
             continue // Skip scheduling this round, but keep looping
         }
 
         taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-            stop = true // assume we're done until we find a task to schedule
+            stop = true // Assume we're done until we find a task to schedule
 
             var tasks []struct {
                 SpID         int64 `db:"sp_id"`
@@ -507,7 +515,7 @@ func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskF
                 return false, xerrors.Errorf("updating task id: %w", err)
             }
 
-            stop = false // found a task to schedule, keep going
+            stop = false // We found a task to schedule, keep going
             return true, nil
         })
     }
@@ -525,7 +533,7 @@ func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskF
 
     for _, t := range tasks {
         if err := s.updateLanded(ctx, t.SpID, t.SectorNumber); err != nil {
-            log.Errorw("updating landed", "sp", t.SpID, "sector", t.SectorNumber, "err", err)
+            log.Errorw("Updating landed", "sp", t.SpID, "sector", t.SectorNumber, "err", err)
         }
     }
 

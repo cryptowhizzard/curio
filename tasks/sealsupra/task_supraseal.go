@@ -237,16 +237,49 @@ func (s *SupraSeal) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 
 		ctx := context.WithValue(ctx, paths.SpaceUseKey, paths.SpaceUseFunc(SupraSpaceUse))
 
-		ps, pathIDs, err := s.storage.AcquireSector(ctx, sref, storiface.FTNone, alloc, storiface.PathSealing, storiface.AcquireMove)
-		if err != nil {
-			return false, xerrors.Errorf("acquiring sector storage: %w", err)
-		}
+// Acquire sector storage
+ps, pathIDs, err := s.storage.AcquireSector(ctx, sref, storiface.FTNone, alloc, storiface.PathSealing, storiface.AcquireMove)
+if err != nil {
+    return false, xerrors.Errorf("acquiring sector storage: %w", err)
+}
 
-		outPaths[i] = supraffi.Path{
-			Replica: ps.Sealed,
-			Cache:   ps.Cache,
-		}
-		outPathIDs[i] = pathIDs
+// Initialize paths to the default acquired paths
+selectedReplicaPath := ps.Sealed
+selectedCachePath := ps.Cache
+
+// Check if the determined paths already contain sectors; if so, find the next available
+for _, basePath := range []string{ps.Sealed, ps.Cache} {
+    markerPath := filepath.Join(basePath, "in_use_marker")
+
+    // Ensure the directory exists
+    if err := os.MkdirAll(filepath.Dir(markerPath), 0755); err != nil {
+        log.Errorf("Failed to create directory for marker file %s: %s", filepath.Dir(markerPath), err)
+        continue
+    }
+
+    // Check if the marker file exists
+    if _, err := os.Stat(markerPath); os.IsNotExist(err) {
+        // Create the marker file to mark this path as in use
+        if err := os.WriteFile(markerPath, []byte{}, 0644); err != nil {
+            log.Errorf("Failed to create marker file for path %s: %s", markerPath, err)
+            continue
+        }
+
+        // Assign this path as selected
+        selectedReplicaPath = filepath.Join(basePath, filepath.Base(ps.Sealed))
+        selectedCachePath = filepath.Join(basePath, filepath.Base(ps.Cache))
+        break
+    }
+}
+
+// Assign the dynamically chosen paths
+outPaths[i] = supraffi.Path{
+    Replica: selectedReplicaPath,
+    Cache:   selectedCachePath,
+}
+
+outPathIDs[i] = pathIDs
+
 	}
 
 	s.inSDR.Lock()
@@ -396,6 +429,26 @@ func (s *SupraSeal) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 		s.outSDR.Unlock()
 		// NOTE: We're not releasing the slot yet, we keep it until sector Finalize
 	}
+
+
+log.Infow("batch sector preparation start",
+    "task", taskID,
+    "batch_slot", slot,
+    "num_sectors", len(sectors),
+    "pipeline_slot", slot,
+    "selected_paths", func() []map[string]string {
+        pathsInfo := make([]map[string]string, len(outPaths))
+        for idx, p := range outPaths {
+            pathsInfo[idx] = map[string]string{
+                "sector_index": fmt.Sprintf("%d", idx),
+                "replica_path": p.Replica,
+                "cache_path":   p.Cache,
+            }
+        }
+        return pathsInfo
+    }(),
+)
+
 
 	return true, nil
 }

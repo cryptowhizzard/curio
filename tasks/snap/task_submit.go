@@ -132,25 +132,25 @@ func checkGasFees() (bool, error) {
 		return false, err
 	}
 
-	// Update the cache and timestamp
-	cachedResult = string(body) == "1"
+	// Check the body for "1" or "0"
+	bodyStr := string(body)
+	cachedResult = bodyStr == "1"
 	lastChecked = time.Now()
 
 	return cachedResult, nil
 }
 
 func (s *SubmitTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-
-	highFees, err := checkGasFees()
-    	if err != nil {
-        	log.Infow("Error checking gas fees:", err)
-        	return false, err
-    	}
-   	 if highFees {
-        	log.Infow("Gas fees are high, postponing submission.")
-        	return false, nil
-    	}
-    	log.Infow("Gas fees are low, proceeding with submission.")
+	lowFees, err := checkGasFees()  // Rename variable to reflect actual condition it's checking
+	if err != nil {
+		log.Errorw("Error checking gas fees", "error", err)
+		return false, err
+	}
+	if !lowFees {  // Correct condition based on new variable name
+		log.Infow("Gas fees are high, postponing submission.")
+		return false, nil
+	}
+	log.Infow("Gas fees are low, proceeding with submission.")
 
 	var tasks []struct {
 		SpID         int64 `db:"sp_id"`
@@ -496,63 +496,147 @@ func (s *SubmitTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 }
 
+// Avoid killing the chain and fix some time 
+var (
+	lastScheduled time.Time
+	scheduleMutex sync.Mutex
+)
+
 func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-	// schedule submits
-	var stop bool
-	for !stop {
-		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // assume we're done until we find a task to schedule
+    // Check gas fees before scheduling
+    lowFees, err := checkGasFees()
+    if err != nil {
+        log.Errorw("Error checking gas fees", "error", err)
+        return err // Return the error directly
+    }
+    if !lowFees { // Only proceed if gas fees are low
+        log.Infow("Gas fees are high, postponing scheduling.")
+        return nil // Return nil to indicate no scheduling was done
+    }
+    log.Infow("Gas fees are low, proceeding with scheduling.")
 
-			var tasks []struct {
-				SpID         int64 `db:"sp_id"`
-				SectorNumber int64 `db:"sector_number"`
-			}
+    // Rate limit: Only one schedule per minute
+    scheduleMutex.Lock()
+    defer scheduleMutex.Unlock()
 
-			err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
-                                                         AND after_encode = TRUE
-                                                         AND after_prove = TRUE
-                                                         AND after_submit = FALSE
-                                                         AND (submit_after IS NULL OR submit_after < NOW())
-                                                         AND task_id_submit IS NULL`)
-			if err != nil {
-				return false, xerrors.Errorf("getting tasks: %w", err)
-			}
+    if time.Since(lastScheduled) < time.Minute {
+        log.Infow("Scheduling skipped to maintain 1-minute rate limit.")
+        return nil
+    }
 
-			if len(tasks) == 0 {
-				return false, nil
-			}
+    // Schedule the task
+    var stop bool
+    for !stop {
+        taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
+            stop = true // Assume we're done until we find a task to schedule
 
-			// pick at random in case there are a bunch of schedules across the cluster
-			t := tasks[rand.N(len(tasks))]
+            var tasks []struct {
+                SpID         int64 `db:"sp_id"`
+                SectorNumber int64 `db:"sector_number"`
+            }
 
-			_, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
-			if err != nil {
-				return false, xerrors.Errorf("updating task id: %w", err)
-			}
+            err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
+                AND after_encode = TRUE
+                AND after_prove = TRUE
+                AND after_submit = FALSE
+                AND (submit_after IS NULL OR submit_after < NOW())
+                AND task_id_submit IS NULL`)
+            if err != nil {
+                return false, xerrors.Errorf("getting tasks: %w", err)
+            }
 
-			stop = false // we found a task to schedule, keep going
-			return true, nil
-		})
-	}
+            if len(tasks) == 0 {
+                return false, nil
+            }
 
-	// update landed
-	var tasks []struct {
-		SpID         int64 `db:"sp_id"`
-		SectorNumber int64 `db:"sector_number"`
-	}
+            // Pick a random task
+            t := tasks[rand.N(len(tasks))]
 
-	err := s.db.Select(ctx, &tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE after_encode = TRUE AND after_prove = TRUE AND after_prove_msg_success = FALSE AND after_submit = TRUE`)
-	if err != nil {
-		return xerrors.Errorf("getting tasks: %w", err)
-	}
+            _, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
+            if err != nil {
+                return false, xerrors.Errorf("updating task id: %w", err)
+            }
 
-	for _, t := range tasks {
-		if err := s.updateLanded(ctx, t.SpID, t.SectorNumber); err != nil {
-			log.Errorw("updating landed", "sp", t.SpID, "sector", t.SectorNumber, "err", err)
-		}
-	}
+            stop = false // We found a task to schedule, keep going
+            lastScheduled = time.Now() // Update the last scheduled timestamp
+            log.Infow("Task scheduled successfully", "spID", t.SpID, "sectorNumber", t.SectorNumber)
+            return true, nil
+        })
+    }
 
-	return nil
+
+
+
+/*
+func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
+    // Check gas fees before scheduling
+    lowFees, err := checkGasFees()
+    if err != nil {
+        log.Errorw("Error checking gas fees", "error", err)
+        return err // Return the error directly
+    }
+    if !lowFees { // Only proceed if gas fees are low
+        log.Infow("Gas fees are high, postponing scheduling.")
+        return nil // Return nil to indicate no scheduling was done
+    }
+    log.Infow("Gas fees are low, proceeding with scheduling.")
+
+    // Continue with the rest of the scheduling logic
+    var stop bool
+    for !stop {
+        taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
+            stop = true // Assume we're done until we find a task to schedule
+
+            var tasks []struct {
+                SpID         int64 `db:"sp_id"`
+                SectorNumber int64 `db:"sector_number"`
+            }
+
+            err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
+                AND after_encode = TRUE
+                AND after_prove = TRUE
+                AND after_submit = FALSE
+                AND (submit_after IS NULL OR submit_after < NOW())
+                AND task_id_submit IS NULL`)
+            if err != nil {
+                return false, xerrors.Errorf("getting tasks: %w", err)
+            }
+
+            if len(tasks) == 0 {
+                return false, nil
+            }
+
+            // Pick at random in case there are a bunch of schedules across the cluster
+            t := tasks[rand.N(len(tasks))]
+
+            _, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
+            if err != nil {
+                return false, xerrors.Errorf("updating task id: %w", err)
+            }
+
+            stop = false // We found a task to schedule, keep going
+            return true, nil
+        })
+    }
+*/
+    // Update landed tasks
+    var tasks []struct {
+        SpID         int64 `db:"sp_id"`
+        SectorNumber int64 `db:"sector_number"`
+    }
+
+    err = s.db.Select(ctx, &tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE after_encode = TRUE AND after_prove = TRUE AND after_prove_msg_success = FALSE AND after_submit = TRUE`)
+    if err != nil {
+        return xerrors.Errorf("getting tasks: %w", err)
+    }
+
+    for _, t := range tasks {
+        if err := s.updateLanded(ctx, t.SpID, t.SectorNumber); err != nil {
+            log.Errorw("Updating landed", "sp", t.SpID, "sector", t.SectorNumber, "err", err)
+        }
+    }
+
+    return nil
 }
 
 func (s *SubmitTask) updateLanded(ctx context.Context, spId, sectorNum int64) error {

@@ -74,9 +74,9 @@ type submitConfig struct {
 }
 
 type MpoolStatus struct {
-	TotalMessages []string `json:"totalMessages"`
-	LocalMessages []string `json:"localMessages"`
-	PostBlock     string   `json:"postBlock"`
+	TotalMessages json.RawMessage `json:"totalMessages"`
+	LocalMessages json.RawMessage `json:"localMessages"`
+	PostBlock     string          `json:"postBlock"`
 }
 
 type SubmitTask struct {
@@ -510,6 +510,44 @@ var (
 	mpoolMutex        sync.Mutex
 )
 
+
+func parseRawMessageAsIntSum(raw json.RawMessage) (int, error) {
+	var intValue int
+	if err := json.Unmarshal(raw, &intValue); err == nil {
+		return intValue, nil
+	}
+
+	var stringValue string
+	if err := json.Unmarshal(raw, &stringValue); err == nil {
+		return strconv.Atoi(stringValue)
+	}
+
+	var intArray []int
+	if err := json.Unmarshal(raw, &intArray); err == nil {
+		sum := 0
+		for _, v := range intArray {
+			sum += v
+		}
+		return sum, nil
+	}
+
+	var stringArray []string
+	if err := json.Unmarshal(raw, &stringArray); err == nil {
+		sum := 0
+		for _, v := range stringArray {
+			intVal, err := strconv.Atoi(v)
+			if err != nil {
+				return 0, fmt.Errorf("invalid integer in string array: %w", err)
+			}
+			sum += intVal
+		}
+		return sum, nil
+	}
+
+	return 0, fmt.Errorf("unsupported type for field: %s", string(raw))
+}
+
+
 func checkMpoolStatus(actor string) (bool, error) {
 	mpoolMutex.Lock()
 	defer mpoolMutex.Unlock()
@@ -537,12 +575,19 @@ func checkMpoolStatus(actor string) (bool, error) {
 		return false, fmt.Errorf("error unmarshalling mpool API response: %w", err)
 	}
 
-	// Convert strings to integers for comparison
-	totalMessages, _ := strconv.Atoi(status.TotalMessages[0])
-	localMessages, _ := strconv.Atoi(status.LocalMessages[0])
+	// Parse and validate fields
+	totalMessages, err := parseRawMessageAsIntSum(status.TotalMessages)
+	if err != nil {
+		return false, fmt.Errorf("error parsing totalMessages: %w", err)
+	}
+
+	localMessages, err := parseRawMessageAsIntSum(status.LocalMessages)
+	if err != nil {
+		return false, fmt.Errorf("error parsing localMessages: %w", err)
+	}
 
 	// Check constraints
-	if totalMessages > 5000 || localMessages > 20 || status.PostBlock == "yes" {
+	if totalMessages > 10000 || localMessages > 20 || status.PostBlock == "yes" {
 		cachedMpoolResult = false
 	} else {
 		cachedMpoolResult = true
@@ -552,6 +597,45 @@ func checkMpoolStatus(actor string) (bool, error) {
 	lastMpoolChecked = time.Now()
 
 	return cachedMpoolResult, nil
+}
+
+// Helper to parse json.RawMessage as an integer
+func parseRawMessageAsInt(raw json.RawMessage) (int, error) {
+    var result int
+    if err := json.Unmarshal(raw, &result); err == nil {
+        return result, nil
+    }
+
+    var str string
+    if err := json.Unmarshal(raw, &str); err == nil {
+        return strconv.Atoi(str)
+    }
+
+    return 0, fmt.Errorf("unsupported type for integer field: %s", string(raw))
+}
+
+// Helper to parse json.RawMessage as an array of integers and return their sum
+func parseRawMessageAsIntArraySum(raw json.RawMessage) (int, error) {
+    var array []int
+    if err := json.Unmarshal(raw, &array); err == nil {
+        sum := 0
+        for _, v := range array {
+            sum += v
+        }
+        return sum, nil
+    }
+
+    var singleValue int
+    if err := json.Unmarshal(raw, &singleValue); err == nil {
+        return singleValue, nil
+    }
+
+    var str string
+    if err := json.Unmarshal(raw, &str); err == nil {
+        return strconv.Atoi(str)
+    }
+
+    return 0, fmt.Errorf("unsupported type for integer array field: %s", string(raw))
 }
 
 var (

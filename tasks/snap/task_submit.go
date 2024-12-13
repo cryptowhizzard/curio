@@ -496,76 +496,80 @@ func (s *SubmitTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 }
 
-// Avoid killing the chain and fix some time 
 var (
 	lastScheduled time.Time
 	scheduleMutex sync.Mutex
 )
 
+func shouldSchedule() bool {
+	scheduleMutex.Lock()
+	defer scheduleMutex.Unlock()
+
+	// Check if enough time has passed since the last scheduling
+	if time.Since(lastScheduled) < time.Minute {
+		return false
+	}
+
+	// Update the last scheduled time
+	lastScheduled = time.Now()
+	return true
+}
+
 func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-    // Check gas fees before scheduling
-    lowFees, err := checkGasFees()
-    if err != nil {
-        log.Errorw("Error checking gas fees", "error", err)
-        return err // Return the error directly
-    }
-    if !lowFees { // Only proceed if gas fees are low
-        log.Infow("Gas fees are high, postponing scheduling.")
-        return nil // Return nil to indicate no scheduling was done
-    }
-    log.Infow("Gas fees are low, proceeding with scheduling.")
+	if !shouldSchedule() {
+		log.Infow("Skipping schedule to maintain 1-minute rate limit.")
+		return nil
+	}
 
-    // Rate limit: Only one schedule per minute
-    scheduleMutex.Lock()
-    defer scheduleMutex.Unlock()
+	// Check gas fees before scheduling
+	lowFees, err := checkGasFees()
+	if err != nil {
+		log.Errorw("Error checking gas fees", "error", err)
+		return err
+	}
+	if !lowFees { // Only proceed if gas fees are low
+		log.Infow("Gas fees are high, postponing scheduling.")
+		return nil
+	}
+	log.Infow("Gas fees are low, proceeding with scheduling.")
 
-    if time.Since(lastScheduled) < time.Minute {
-        log.Infow("Scheduling skipped to maintain 1-minute rate limit.")
-        return nil
-    }
+	// Schedule the task
+	var stop bool
+	for !stop {
+		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
+			stop = true // Assume we're done until we find a task to schedule
 
-    // Schedule the task
-    var stop bool
-    for !stop {
-        taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-            stop = true // Assume we're done until we find a task to schedule
+			var tasks []struct {
+				SpID         int64 `db:"sp_id"`
+				SectorNumber int64 `db:"sector_number"`
+			}
 
-            var tasks []struct {
-                SpID         int64 `db:"sp_id"`
-                SectorNumber int64 `db:"sector_number"`
-            }
-
-            err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
+			err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
                 AND after_encode = TRUE
                 AND after_prove = TRUE
                 AND after_submit = FALSE
                 AND (submit_after IS NULL OR submit_after < NOW())
                 AND task_id_submit IS NULL`)
-            if err != nil {
-                return false, xerrors.Errorf("getting tasks: %w", err)
-            }
+			if err != nil {
+				return false, xerrors.Errorf("getting tasks: %w", err)
+			}
 
-            if len(tasks) == 0 {
-                return false, nil
-            }
+			if len(tasks) == 0 {
+				return false, nil
+			}
 
-            // Pick a random task
-            t := tasks[rand.N(len(tasks))]
+			// Pick a random task
+			t := tasks[rand.N(len(tasks))]
 
-            _, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
-            if err != nil {
-                return false, xerrors.Errorf("updating task id: %w", err)
-            }
+			_, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
+			if err != nil {
+				return false, xerrors.Errorf("updating task id: %w", err)
+			}
 
-            stop = false // We found a task to schedule, keep going
-            lastScheduled = time.Now() // Update the last scheduled timestamp
-            log.Infow("Task scheduled successfully", "spID", t.SpID, "sectorNumber", t.SectorNumber)
-            return true, nil
-        })
-    }
-
-
-
+			log.Infow("Task scheduled successfully", "spID", t.SpID, "sectorNumber", t.SectorNumber)
+			return true, nil
+		})
+	}
 
 /*
 func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {

@@ -589,6 +589,7 @@ func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskF
         log.Infow("Gas fees are high, postponing scheduling.")
         return nil
     }
+
     log.Infow("Gas fees are low, proceeding with scheduling.")
 
     // Schedule the task
@@ -643,59 +644,6 @@ func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskF
         })
     }
 
-
-/*
-func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-    // Check gas fees before scheduling
-    lowFees, err := checkGasFees()
-    if err != nil {
-        log.Errorw("Error checking gas fees", "error", err)
-        return err // Return the error directly
-    }
-    if !lowFees { // Only proceed if gas fees are low
-        log.Infow("Gas fees are high, postponing scheduling.")
-        return nil // Return nil to indicate no scheduling was done
-    }
-    log.Infow("Gas fees are low, proceeding with scheduling.")
-
-    // Continue with the rest of the scheduling logic
-    var stop bool
-    for !stop {
-        taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-            stop = true // Assume we're done until we find a task to schedule
-
-            var tasks []struct {
-                SpID         int64 `db:"sp_id"`
-                SectorNumber int64 `db:"sector_number"`
-            }
-
-            err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
-                AND after_encode = TRUE
-                AND after_prove = TRUE
-                AND after_submit = FALSE
-                AND (submit_after IS NULL OR submit_after < NOW())
-                AND task_id_submit IS NULL`)
-            if err != nil {
-                return false, xerrors.Errorf("getting tasks: %w", err)
-            }
-
-            if len(tasks) == 0 {
-                return false, nil
-            }
-
-            // Pick at random in case there are a bunch of schedules across the cluster
-            t := tasks[rand.N(len(tasks))]
-
-            _, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
-            if err != nil {
-                return false, xerrors.Errorf("updating task id: %w", err)
-            }
-
-            stop = false // We found a task to schedule, keep going
-            return true, nil
-        })
-    }
-*/
     // Update landed tasks
     var tasks []struct {
         SpID         int64 `db:"sp_id"`

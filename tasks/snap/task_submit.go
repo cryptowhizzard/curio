@@ -10,6 +10,7 @@ import (
     	"io/ioutil"
     	"sync"
     	"time"
+	"strconv"
 
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
@@ -70,6 +71,12 @@ type submitConfig struct {
 	RequireNotificationSuccess bool
 	CollateralFromMinerBalance bool
 	DisableCollateralFallback  bool
+}
+
+type MpoolStatus struct {
+	TotalMessages []string `json:"totalMessages"`
+	LocalMessages []string `json:"localMessages"`
+	PostBlock     string   `json:"postBlock"`
 }
 
 type SubmitTask struct {
@@ -496,6 +503,57 @@ func (s *SubmitTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 }
 
+// Check the mpool to avoid schedule submits when we are already loaded.
+var (
+	lastMpoolChecked  time.Time
+	cachedMpoolResult bool
+	mpoolMutex        sync.Mutex
+)
+
+func checkMpoolStatus(actor string) (bool, error) {
+	mpoolMutex.Lock()
+	defer mpoolMutex.Unlock()
+
+	// Check if cached result is still valid
+	if time.Since(lastMpoolChecked) < 30*time.Second {
+		return cachedMpoolResult, nil
+	}
+
+	// Make the API call
+	url := fmt.Sprintf("http://212.6.53.183/mpool.php?actor=%s", actor)
+	resp, err := http.Get(url)
+	if err != nil {
+		return false, fmt.Errorf("error calling mpool API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("error reading mpool API response: %w", err)
+	}
+
+	var status MpoolStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		return false, fmt.Errorf("error unmarshalling mpool API response: %w", err)
+	}
+
+	// Convert strings to integers for comparison
+	totalMessages, _ := strconv.Atoi(status.TotalMessages[0])
+	localMessages, _ := strconv.Atoi(status.LocalMessages[0])
+
+	// Check constraints
+	if totalMessages > 5000 || localMessages > 20 || status.PostBlock == "yes" {
+		cachedMpoolResult = false
+	} else {
+		cachedMpoolResult = true
+	}
+
+	// Update the last checked time
+	lastMpoolChecked = time.Now()
+
+	return cachedMpoolResult, nil
+}
+
 var (
 	lastScheduled time.Time
 	scheduleMutex sync.Mutex
@@ -516,60 +574,75 @@ func shouldSchedule() bool {
 }
 
 func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-	if !shouldSchedule() {
-		log.Infow("Skipping schedule to maintain 1-minute rate limit.")
-		return nil
-	}
+    if !shouldSchedule() {
+        log.Infow("Skipping schedule to maintain 1-minute rate limit.")
+        return nil
+    }
 
-	// Check gas fees before scheduling
-	lowFees, err := checkGasFees()
-	if err != nil {
-		log.Errorw("Error checking gas fees", "error", err)
-		return err
-	}
-	if !lowFees { // Only proceed if gas fees are low
-		log.Infow("Gas fees are high, postponing scheduling.")
-		return nil
-	}
-	log.Infow("Gas fees are low, proceeding with scheduling.")
+    // Check gas fees before scheduling
+    lowFees, err := checkGasFees()
+    if err != nil {
+        log.Errorw("Error checking gas fees", "error", err)
+        return err
+    }
+    if !lowFees {
+        log.Infow("Gas fees are high, postponing scheduling.")
+        return nil
+    }
+    log.Infow("Gas fees are low, proceeding with scheduling.")
 
-	// Schedule the task
-	var stop bool
-	for !stop {
-		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // Assume we're done until we find a task to schedule
+    // Schedule the task
+    var stop bool
+    for !stop {
+        taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
+            stop = true // Assume we're done until we find a task to schedule
 
-			var tasks []struct {
-				SpID         int64 `db:"sp_id"`
-				SectorNumber int64 `db:"sector_number"`
-			}
+            var tasks []struct {
+                SpID         int64 `db:"sp_id"`
+                SectorNumber int64 `db:"sector_number"`
+            }
 
-			err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
+            // Select eligible tasks from the database
+            err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE failed = FALSE
                 AND after_encode = TRUE
                 AND after_prove = TRUE
                 AND after_submit = FALSE
                 AND (submit_after IS NULL OR submit_after < NOW())
                 AND task_id_submit IS NULL`)
-			if err != nil {
-				return false, xerrors.Errorf("getting tasks: %w", err)
-			}
+            if err != nil {
+                return false, xerrors.Errorf("getting tasks: %w", err)
+            }
 
-			if len(tasks) == 0 {
-				return false, nil
-			}
+            if len(tasks) == 0 {
+                return false, nil
+            }
 
-			// Pick a random task
-			t := tasks[rand.N(len(tasks))]
+            // Pick a random task
+            t := tasks[rand.N(len(tasks))]
 
-			_, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
-			if err != nil {
-				return false, xerrors.Errorf("updating task id: %w", err)
-			}
+            // Use SpID for actor in the mpool check
+            actor := fmt.Sprintf("%d", t.SpID)
+            mpoolAllowed, err := checkMpoolStatus(actor)
+            if err != nil {
+                log.Errorw("Error checking mpool status", "error", err)
+                return false, err
+            }
+            if !mpoolAllowed {
+                log.Infow("Mpool constraints not met, postponing scheduling.")
+                return false, nil
+            }
 
-			log.Infow("Task scheduled successfully", "spID", t.SpID, "sectorNumber", t.SectorNumber)
-			return true, nil
-		})
-	}
+            // Update the database with the scheduled task
+            _, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_submit = $1, submit_after = NULL WHERE sp_id = $2 AND sector_number = $3`, id, t.SpID, t.SectorNumber)
+            if err != nil {
+                return false, xerrors.Errorf("updating task id: %w", err)
+            }
+
+            log.Infow("Task scheduled successfully", "spID", t.SpID, "sectorNumber", t.SectorNumber)
+            return true, nil
+        })
+    }
+
 
 /*
 func (s *SubmitTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/georgysavva/scany/v2/dbscan"
@@ -16,35 +17,67 @@ import (
 
 var errTx = errors.New("cannot use a non-transaction func in a transaction")
 
-const InitialSerializationErrorRetryWait = 5 * time.Second
+const InitialSerializationErrorRetryWait = 200 * time.Millisecond
+const maxRetries = 10
 
 // rawStringOnly is _intentionally_private_ to force only basic strings in SQL queries.
-// In any package, raw strings will satisfy compilation.  Ex:
-//
-//	harmonydb.Exec("INSERT INTO version (number) VALUES (1)")
-//
-// This prevents SQL injection attacks where the input contains query fragments.
 type rawStringOnly string
 
-// Exec executes changes (INSERT, DELETE,  or UPDATE).
-// Note, for CREATE & DROP please keep these permanent and express
-// them in the ./sql/ files (next number).
+// ---------- Retriable error helpers ----------
+
+func IsErrSerialization(err error) bool {
+	var e2 *pgconn.PgError
+	return errors.As(err, &e2) && e2.Code == pgerrcode.SerializationFailure // 40001
+}
+
+func IsErrDeadlock(err error) bool {
+	var e2 *pgconn.PgError
+	return errors.As(err, &e2) && e2.Code == pgerrcode.DeadlockDetected // 40P01
+}
+
+// Yugabyte sometimes surfaces tablet conflicts/deadlocks/expiry as XX000,
+// e.g. "Operation expired", "deadlock", "conflict".
+func isYBConflictXX000(err error) bool {
+	var e2 *pgconn.PgError
+	if !errors.As(err, &e2) {
+		return false
+	}
+	if e2.Code != pgerrcode.InternalError { // "XX000"
+		return false
+	}
+	m := strings.ToLower(e2.Message)
+	d := strings.ToLower(e2.Detail)
+	return strings.Contains(m, "deadlock") || strings.Contains(d, "deadlock") ||
+		strings.Contains(m, "conflict") || strings.Contains(d, "conflict") ||
+		strings.Contains(m, "operation expired") || strings.Contains(d, "operation expired")
+}
+
+func isRetriable(err error) bool {
+	return IsErrSerialization(err) || IsErrDeadlock(err) || isYBConflictXX000(err)
+}
+
+// ---------- Non-transactional operations with retries ----------
+
+// Exec executes changes (INSERT, DELETE, UPDATE), with retries on retriable errors.
 func (db *DB) Exec(ctx context.Context, sql rawStringOnly, arguments ...any) (count int, err error) {
 	if db.usedInTransaction() {
 		return 0, errTx
 	}
 
 	retryWait := InitialSerializationErrorRetryWait
-
-retry:
-	res, err := db.pgx.Exec(ctx, string(sql), arguments...)
-	if err != nil && IsErrSerialization(err) {
-		time.Sleep(retryWait)
-		retryWait *= 2
-		goto retry
+	for i := 0; i < maxRetries; i++ {
+		res, e := db.pgx.Exec(ctx, string(sql), arguments...)
+		if e != nil && isRetriable(e) {
+			logger.Warnw("Exec retry due to retriable error",
+				"attempt", i+1, "max", maxRetries, "err", e.Error())
+			time.Sleep(retryWait)
+			retryWait *= 2
+			err = e
+			continue
+		}
+		return int(res.RowsAffected()), e
 	}
-
-	return int(res.RowsAffected()), err
+	return 0, err
 }
 
 type Qry interface {
@@ -55,37 +88,34 @@ type Qry interface {
 	Values() ([]any, error)
 }
 
-// Query offers Next/Err/Close/Scan/Values
 type Query struct {
 	Qry
 }
 
-// Query allows iterating returned values to save memory consumption
-// with the downside of needing to `defer q.Close()`. For a simpler interface,
-// try Select()
-// Next() must be called to advance the row cursor, including the first time:
-// Ex:
-// q, err := db.Query(ctx, "SELECT id, name FROM users")
-// handleError(err)
-// defer q.Close()
-//
-//	for q.Next() {
-//		  var id int
-//	   var name string
-//	   handleError(q.Scan(&id, &name))
-//	   fmt.Println(id, name)
-//	}
+// Query offers Next/Err/Close/Scan/Values, with retries at open time.
 func (db *DB) Query(ctx context.Context, sql rawStringOnly, arguments ...any) (*Query, error) {
 	if db.usedInTransaction() {
 		return &Query{}, errTx
 	}
-	q, err := db.pgx.Query(ctx, string(sql), arguments...)
-	return &Query{q}, err
+
+	retryWait := InitialSerializationErrorRetryWait
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		q, e := db.pgx.Query(ctx, string(sql), arguments...)
+		if e != nil && isRetriable(e) {
+			logger.Warnw("Query retry due to retriable error",
+				"attempt", i+1, "max", maxRetries, "err", e.Error())
+			time.Sleep(retryWait)
+			retryWait *= 2
+			lastErr = e
+			continue
+		}
+		return &Query{q}, e
+	}
+	return &Query{}, lastErr
 }
 
 // StructScan allows scanning a single row into a struct.
-// This improves efficiency of processing large result sets
-// by avoiding the need to allocate a slice of structs.
 func (q *Query) StructScan(s any) error {
 	return dbscan.ScanRow(s, dbscanRows{q.Qry.(pgx.Rows)})
 }
@@ -98,18 +128,29 @@ type rowErr struct{}
 
 func (rowErr) Scan(_ ...any) error { return errTx }
 
-// QueryRow gets 1 row using column order matching.
-// This is a timesaver for the special case of wanting the first row returned only.
-// EX:
-//
-//	var name, pet string
-//	var ID = 123
-//	err := db.QueryRow(ctx, "SELECT name, pet FROM users WHERE ID=?", ID).Scan(&name, &pet)
+// QueryRow gets 1 row using column order matching, with retries.
+// We perform a test Scan into a dummy value to force early error detection,
+// then return a fresh QueryRow for the caller to Scan real destinations.
 func (db *DB) QueryRow(ctx context.Context, sql rawStringOnly, arguments ...any) Row {
 	if db.usedInTransaction() {
 		return rowErr{}
 	}
-	return db.pgx.QueryRow(ctx, string(sql), arguments...)
+
+	retryWait := InitialSerializationErrorRetryWait
+	for i := 0; i < maxRetries; i++ {
+		r := db.pgx.QueryRow(ctx, string(sql), arguments...)
+		var dummy any
+		err := r.Scan(&dummy)
+		if err == nil || !isRetriable(err) {
+			// Return a fresh row so the caller can scan for real.
+			return db.pgx.QueryRow(ctx, string(sql), arguments...)
+		}
+		logger.Warnw("QueryRow retry due to retriable error",
+			"attempt", i+1, "max", maxRetries, "err", err.Error())
+		time.Sleep(retryWait)
+		retryWait *= 2
+	}
+	return rowErr{}
 }
 
 type dbscanRows struct {
@@ -130,128 +171,49 @@ func (d dbscanRows) NextResultSet() bool {
 	return false
 }
 
-/*
-Select multiple rows into a slice using name matching
-Ex:
-
-	type user struct {
-		Name string
-		ID int
-		Number string `db:"tel_no"`
-	}
-
-	var users []user
-	pet := "cat"
-	err := db.Select(ctx, &users, "SELECT name, id, tel_no FROM customers WHERE pet=?", pet)
-*/
+// Select multiple rows into a slice using name matching, with retries on open and on scanning.
 func (db *DB) Select(ctx context.Context, sliceOfStructPtr any, sql rawStringOnly, arguments ...any) error {
 	if db.usedInTransaction() {
 		return errTx
 	}
-	rows, err := db.pgx.Query(ctx, string(sql), arguments...)
-	if err != nil {
+
+	retryWait := InitialSerializationErrorRetryWait
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		rows, e := db.pgx.Query(ctx, string(sql), arguments...)
+		if e != nil {
+			if isRetriable(e) {
+				logger.Warnw("Select retry due to retriable error (open)",
+					"attempt", i+1, "max", maxRetries, "err", e.Error())
+				time.Sleep(retryWait)
+				retryWait *= 2
+				lastErr = e
+				continue
+			}
+			return e
+		}
+
+		err := dbscan.ScanAll(sliceOfStructPtr, dbscanRows{rows})
+		rows.Close()
+		if err != nil && isRetriable(err) {
+			logger.Warnw("Select retry due to retriable error (scan)",
+				"attempt", i+1, "max", maxRetries, "err", err.Error())
+			time.Sleep(retryWait)
+			retryWait *= 2
+			lastErr = err
+			continue
+		}
+
 		return err
 	}
-	defer rows.Close()
-	return dbscan.ScanAll(sliceOfStructPtr, dbscanRows{rows})
+	return lastErr
 }
+
+// ---------- Transaction support ----------
 
 type Tx struct {
 	pgx.Tx
 	ctx context.Context
-}
-
-// usedInTransaction is a helper to prevent nesting transactions
-// & non-transaction calls in transactions. It only checks 20 frames.
-// Fast: This memory should all be in CPU Caches.
-func (db *DB) usedInTransaction() bool {
-	var framePtrs = (&[20]uintptr{})[:]                   // 20 can be stack-local (no alloc)
-	framePtrs = framePtrs[:runtime.Callers(3, framePtrs)] // skip past our caller.
-	return lo.Contains(framePtrs, db.BTFP.Load())         // Unsafe read @ beginTx overlap, but 'return false' is correct there.
-}
-
-type TransactionOptions struct {
-	RetrySerializationError            bool
-	InitialSerializationErrorRetryWait time.Duration
-}
-
-type TransactionOption func(*TransactionOptions)
-
-func OptionRetry() TransactionOption {
-	return func(o *TransactionOptions) {
-		o.RetrySerializationError = true
-	}
-}
-
-func OptionSerialRetryTime(d time.Duration) TransactionOption {
-	return func(o *TransactionOptions) {
-		o.InitialSerializationErrorRetryWait = d
-	}
-}
-
-// BeginTransaction is how you can access transactions using this library.
-// The entire transaction happens in the function passed in.
-// The return must be true or a rollback will occur.
-// Be sure to test the error for IsErrSerialization() if you want to retry
-//
-//	when there is a DB serialization error.
-//
-//go:noinline
-func (db *DB) BeginTransaction(ctx context.Context, f func(*Tx) (commit bool, err error), opt ...TransactionOption) (didCommit bool, retErr error) {
-	db.BTFPOnce.Do(func() {
-		fp := make([]uintptr, 20)
-		runtime.Callers(1, fp)
-		db.BTFP.Store(fp[0])
-	})
-	if db.usedInTransaction() {
-		return false, errTx
-	}
-
-	opts := TransactionOptions{
-		RetrySerializationError:            false,
-		InitialSerializationErrorRetryWait: InitialSerializationErrorRetryWait,
-	}
-
-	for _, o := range opt {
-		o(&opts)
-	}
-
-retry:
-	comm, err := db.transactionInner(ctx, f)
-	if err != nil && opts.RetrySerializationError && IsErrSerialization(err) {
-		time.Sleep(opts.InitialSerializationErrorRetryWait)
-		opts.InitialSerializationErrorRetryWait *= 2
-		goto retry
-	}
-
-	return comm, err
-}
-
-func (db *DB) transactionInner(ctx context.Context, f func(*Tx) (commit bool, err error)) (didCommit bool, retErr error) {
-	tx, err := db.pgx.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return false, err
-	}
-	var commit bool
-	defer func() { // Panic clean-up.
-		if !commit {
-			if tmp := tx.Rollback(ctx); tmp != nil {
-				retErr = tmp
-			}
-		}
-	}()
-	commit, err = f(&Tx{tx, ctx})
-	if err != nil {
-		return false, err
-	}
-	if commit {
-		err = tx.Commit(ctx)
-		if err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	return false, nil
 }
 
 // Exec in a transaction.
@@ -281,24 +243,105 @@ func (t *Tx) Select(sliceOfStructPtr any, sql rawStringOnly, arguments ...any) e
 	return dbscan.ScanAll(sliceOfStructPtr, dbscanRows{rows.Qry.(pgx.Rows)})
 }
 
+// usedInTransaction detects if caller is already inside a transaction.
+func (db *DB) usedInTransaction() bool {
+	var framePtrs = (&[20]uintptr{})[:]
+	framePtrs = framePtrs[:runtime.Callers(3, framePtrs)]
+	return lo.Contains(framePtrs, db.BTFP.Load())
+}
+
+type TransactionOptions struct {
+	RetrySerializationError            bool
+	InitialSerializationErrorRetryWait time.Duration
+}
+
+type TransactionOption func(*TransactionOptions)
+
+func OptionRetry() TransactionOption {
+	return func(o *TransactionOptions) {
+		o.RetrySerializationError = true
+	}
+}
+
+func OptionSerialRetryTime(d time.Duration) TransactionOption {
+	return func(o *TransactionOptions) {
+		o.InitialSerializationErrorRetryWait = d
+	}
+}
+
+// BeginTransaction runs f inside a transaction, with optional retries on retriable errors.
+func (db *DB) BeginTransaction(ctx context.Context, f func(*Tx) (commit bool, err error), opt ...TransactionOption) (didCommit bool, retErr error) {
+	db.BTFPOnce.Do(func() {
+		fp := make([]uintptr, 20)
+		runtime.Callers(1, fp)
+		db.BTFP.Store(fp[0])
+	})
+	if db.usedInTransaction() {
+		return false, errTx
+	}
+
+	opts := TransactionOptions{
+		RetrySerializationError:            false,
+		InitialSerializationErrorRetryWait: InitialSerializationErrorRetryWait,
+	}
+	for _, o := range opt {
+		o(&opts)
+	}
+
+	retryWait := opts.InitialSerializationErrorRetryWait
+	for {
+		comm, err := db.transactionInner(ctx, f)
+		if err != nil && opts.RetrySerializationError && isRetriable(err) {
+			logger.Warnw("BeginTransaction retry due to retriable error",
+				"err", err.Error(), "retryWait", retryWait)
+			time.Sleep(retryWait)
+			retryWait *= 2
+			continue
+		}
+		return comm, err
+	}
+}
+
+func (db *DB) transactionInner(ctx context.Context, f func(*Tx) (commit bool, err error)) (didCommit bool, retErr error) {
+	tx, err := db.pgx.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	var commit bool
+	defer func() {
+		if !commit {
+			if tmp := tx.Rollback(ctx); tmp != nil {
+				retErr = tmp
+			}
+		}
+	}()
+	commit, err = f(&Tx{tx, ctx})
+	if err != nil {
+		return false, err
+	}
+	if commit {
+		err = tx.Commit(ctx)
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// ---------- Other helpers ----------
+
 func IsErrUniqueContraint(err error) bool {
 	var e2 *pgconn.PgError
 	return errors.As(err, &e2) && e2.Code == pgerrcode.UniqueViolation
 }
 
-func IsErrSerialization(err error) bool {
-	var e2 *pgconn.PgError
-	return errors.As(err, &e2) && e2.Code == pgerrcode.SerializationFailure
-}
-
-// IsErrDDLConflict returns true if the error is a DDL conflict (object already exists or doesn't exist)
 func IsErrDDLConflict(err error) bool {
 	var e2 *pgconn.PgError
 	if !errors.As(err, &e2) {
 		return false
 	}
 
-	// DDL conflict error codes
 	ddlConflictCodes := map[string]bool{
 		"42710": true, // duplicate_object
 		"42712": true, // duplicate_alias
@@ -318,3 +361,4 @@ func IsErrDDLConflict(err error) bool {
 
 	return ddlConflictCodes[e2.Code]
 }
+

@@ -726,52 +726,55 @@ func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, exi
 		return true, nil
 	}
 
-	// First find existing files
-	for _, fileType := range storiface.PathTypes {
-		// also try to find existing sectors if we're allocating
-		if fileType&(existing|allocate) == 0 {
-			continue
-		}
+        // First find existing files
+        for _, fileType := range storiface.PathTypes {
+                // also try to find existing sectors if we're allocating
+                if fileType&(existing|allocate) == 0 {
+                        continue
+                }
 
-		si, err := st.index.StorageFindSector(ctx, sid.ID, fileType, ssize, false)
-		if err != nil {
-			if fileType&existing != 0 {
-				log.Warnf("finding existing sector %d(t:%d) failed: %+v", sid, fileType, err)
-			}
-			continue
-		}
+                // use batched find instead of single-sector lookup
+                infosMap, err := st.index.StorageFindSectors(ctx, []abi.SectorID{sid.ID}, fileType, ssize, false)
+                if err != nil {
+                        if fileType&existing != 0 {
+                                log.Warnf("finding existing sector %d(t:%d) failed: %+v", sid, fileType, err)
+                        }
+                        continue
+                }
 
-		for _, info := range si {
-			p, ok := st.paths[info.ID]
-			if !ok {
-				continue
-			}
+                // pull result for this sid
+                si := infosMap[sid.ID]
 
-			if p.Local == "" { // TODO: can that even be the case?
-				continue
-			}
+                for _, info := range si {
+                        p, ok := st.paths[info.ID]
+                        if !ok {
+                                continue
+                        }
+                        if p.Local == "" {
+                                continue
+                        }
 
-			if allocate.Has(fileType) {
-				ok, err := allocPathOk(info.CanSeal, info.CanStore, info.AllowTypes, info.DenyTypes, info.AllowMiners, info.DenyMiners, fileType, sid.ID.Miner)
-				if err != nil {
-					log.Warnw("checking path eligibility failed", "id", sid, "type", fileType, "pathType", pathType, "op", op, "info", info, "err", err)
-					continue
-				}
-				if !ok {
-					log.Debugw("cannot allocate for", "id", sid, "type", fileType, "pathType", pathType, "op", op, "info", info)
-					continue // allocate request for a path of different type
-				}
-			}
+                        if allocate.Has(fileType) {
+                                ok, err := allocPathOk(info.CanSeal, info.CanStore, info.AllowTypes, info.DenyTypes, info.AllowMiners, info.DenyMiners, fileType, sid.ID.Miner)
+                                if err != nil {
+                                        log.Warnw("checking path eligibility failed", "id", sid, "type", fileType, "pathType", pathType, "op", op, "info", info, "err", err)
+                                        continue
+                                }
+                                if !ok {
+                                        log.Debugw("cannot allocate for", "id", sid, "type", fileType, "pathType", pathType, "op", op, "info", info)
+                                        continue
+                                }
+                        }
 
-			spath := p.sectorPath(sid.ID, fileType)
-			storiface.SetPathByType(&out, fileType, spath)
-			storiface.SetPathByType(&storageIDs, fileType, string(info.ID))
+                        spath := p.sectorPath(sid.ID, fileType)
+                        storiface.SetPathByType(&out, fileType, spath)
+                        storiface.SetPathByType(&storageIDs, fileType, string(info.ID))
 
-			existing = existing.Unset(fileType)
-			allocate = allocate.Unset(fileType)
-			break
-		}
-	}
+                        existing = existing.Unset(fileType)
+                        allocate = allocate.Unset(fileType)
+                        break
+                }
+        }
 
 	// Then allocate for allocation requests
 	for _, fileType := range storiface.PathTypes {

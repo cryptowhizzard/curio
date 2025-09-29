@@ -33,6 +33,8 @@ type SectorIndex interface { // part of storage-miner api
 
 	StorageDeclareSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType, primary bool) error
 	StorageDropSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType) error
+	// add this new method
+	StorageFindSectors(ctx context.Context, sectors []abi.SectorID, ft storiface.SectorFileType, ssize abi.SectorSize, allowFetch bool) (map[abi.SectorID][]storiface.SectorStorageInfo, error)
 	StorageFindSector(ctx context.Context, sector abi.SectorID, ft storiface.SectorFileType, ssize abi.SectorSize, allowFetch bool) ([]storiface.SectorStorageInfo, error)
 	BatchStorageDeclareSectors(ctx context.Context, declarations []SectorDeclaration) error
 

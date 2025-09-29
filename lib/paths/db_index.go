@@ -27,6 +27,11 @@ import (
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
 )
 
+var storageListCache struct {
+	data   map[storiface.ID][]storiface.Decl
+	expiry time.Time
+}
+
 const NoMinerFilter = abi.ActorID(0)
 
 const URLSeparator = ","
@@ -50,6 +55,11 @@ func NewDBIndex(al alertinginterface.AlertingInterface, db *harmonydb.DB) *DBInd
 }
 
 func (dbi *DBIndex) StorageList(ctx context.Context) (map[storiface.ID][]storiface.Decl, error) {
+
+	// check cache first
+	if time.Now().Before(storageListCache.expiry) && storageListCache.data != nil {
+		return storageListCache.data, nil
+	}
 
 	var sectorEntries []struct {
 		StorageId      string
@@ -97,6 +107,9 @@ func (dbi *DBIndex) StorageList(ctx context.Context) (map[storiface.ID][]storifa
 		}
 	}
 
+	// update cache
+	storageListCache.data = out
+	storageListCache.expiry = time.Now().Add(60 * time.Second)
 	return out, nil
 }
 
@@ -205,7 +218,8 @@ func (dbi *DBIndex) StorageAttach(ctx context.Context, si storiface.StorageInfo,
 				currUrls = strings.Split(urls.String, URLSeparator)
 			}
 			currUrls = union(currUrls, si.URLs)
-
+			retryWait := 100 * time.Millisecond
+			for i := 0; i < 5; i++ {
 			_, err = tx.Exec(
 				"UPDATE storage_path set urls=$1, weight=$2, max_storage=$3, can_seal=$4, can_store=$5, groups=$6, allow_to=$7, allow_types=$8, deny_types=$9, allow_miners=$10, deny_miners=$11, last_heartbeat=NOW() WHERE storage_id=$12",
 				strings.Join(currUrls, URLSeparator),
@@ -220,8 +234,16 @@ func (dbi *DBIndex) StorageAttach(ctx context.Context, si storiface.StorageInfo,
 				strings.Join(si.AllowMiners, ","),
 				strings.Join(si.DenyMiners, ","),
 				si.ID)
-			if err != nil {
-				return false, xerrors.Errorf("storage attach UPDATE fails: %w", err)
+
+			if err == nil || !harmonydb.IsErrSerialization(err) {
+        			break
+    				}
+    			time.Sleep(retryWait)
+    				retryWait *= 2
+			}
+				if err != nil {
+				return false, xerrors.Errorf("storage attach UPDATE fails after retries: %w", err)
+				//return false, xerrors.Errorf("storage attach UPDATE fails: %w", err)
 			}
 
 			return true, nil
@@ -385,27 +407,54 @@ func (dbi *DBIndex) StorageDeclareSector(ctx context.Context, storageID storifac
 		return xerrors.Errorf("invalid filetype")
 	}
 
-	_, err := dbi.harmonyDB.Exec(ctx, `
-        INSERT INTO sector_location (miner_id, sector_num, sector_filetype, storage_id, is_primary)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (miner_id, sector_num, sector_filetype, storage_id)
-        DO UPDATE SET is_primary = 
-            CASE 
-                WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
-                ELSE sector_location.is_primary 
-            END
-        WHERE sector_location.is_primary IS DISTINCT FROM
-            CASE 
-                WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
-                ELSE sector_location.is_primary 
-            END
-    `,
-		uint64(s.Miner), uint64(s.Number), int(ft), string(storageID), primary)
-	if err != nil {
-		return xerrors.Errorf("DB upsert fails: %w", err)
+	var execErr error
+	retryWait := 100 * time.Millisecond
+
+	for attempt := 0; attempt < 5; attempt++ {
+		_, execErr = dbi.harmonyDB.Exec(ctx, `
+			INSERT INTO sector_location (miner_id, sector_num, sector_filetype, storage_id, is_primary)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (miner_id, sector_num, sector_filetype, storage_id)
+			DO UPDATE SET is_primary = 
+				CASE 
+					WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
+					ELSE sector_location.is_primary 
+				END
+			WHERE sector_location.is_primary IS DISTINCT FROM
+				CASE 
+					WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
+					ELSE sector_location.is_primary 
+				END
+		`,
+			uint64(s.Miner),
+			uint64(s.Number),
+			int(ft),
+			string(storageID),
+			primary,
+		)
+
+		if execErr == nil || !harmonydb.IsErrSerialization(execErr) {
+			break
+		}
+
+		log.Warnw("Retrying StorageDeclareSector due to serialization error",
+			"miner", s.Miner,
+			"sector", s.Number,
+			"fileType", ft,
+			"storage", storageID,
+			"primary", primary,
+			"attempt", attempt+1,
+			"err", execErr.Error())
+
+		time.Sleep(retryWait)
+		retryWait *= 2
 	}
 
-	return err
+	if execErr != nil {
+		return xerrors.Errorf("DB upsert fails after retries: %w", execErr)
+	}
+
+	return nil
 }
 
 // SectorDeclaration represents a single sector declaration
@@ -499,20 +548,20 @@ func (dbi *DBIndex) batchStorageDeclareSectors(ctx context.Context, declarations
 			}
 
 			batch.Queue(`
-                INSERT INTO sector_location (miner_id, sector_num, sector_filetype, storage_id, is_primary)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (miner_id, sector_num, sector_filetype, storage_id)
-                DO UPDATE SET is_primary = 
-                    CASE 
-                        WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
-                        ELSE sector_location.is_primary 
-                    END
-                WHERE sector_location.is_primary IS DISTINCT FROM
-                    CASE 
-                        WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
-                        ELSE sector_location.is_primary 
-                    END
-            `,
+				INSERT INTO sector_location (miner_id, sector_num, sector_filetype, storage_id, is_primary)
+				VALUES ($1, $2, $3, $4, $5)
+				ON CONFLICT (miner_id, sector_num, sector_filetype, storage_id)
+				DO UPDATE SET is_primary = 
+				    CASE 
+				        WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
+				        ELSE sector_location.is_primary 
+				    END
+				WHERE sector_location.is_primary IS DISTINCT FROM
+				    CASE 
+				        WHEN sector_location.is_primary = FALSE AND $5 = TRUE THEN TRUE 
+				        ELSE sector_location.is_primary 
+				    END
+			`,
 				uint64(d.SectorID.Miner),
 				uint64(d.SectorID.Number),
 				int(d.FileType),
@@ -527,9 +576,24 @@ func (dbi *DBIndex) batchStorageDeclareSectors(ctx context.Context, declarations
 		}()
 
 		for i := 0; i < batch.Len(); i++ {
-			_, err := br.Exec()
-			if err != nil {
-				return false, xerrors.Errorf("failed to execute batch item %d: %w", i, err)
+			var execErr error
+			retryWait := 100 * time.Millisecond
+
+			for attempt := 0; attempt < 5; attempt++ {
+				_, execErr = br.Exec()
+				if execErr == nil || !harmonydb.IsErrSerialization(execErr) {
+					break
+				}
+				log.Warnw("Retrying batch Exec due to serialization error",
+					"batchItem", i,
+					"attempt", attempt+1,
+					"err", execErr.Error())
+				time.Sleep(retryWait)
+				retryWait *= 2
+			}
+
+			if execErr != nil {
+				return false, xerrors.Errorf("failed to execute batch item %d after retries: %w", i, execErr)
 			}
 		}
 
@@ -539,21 +603,147 @@ func (dbi *DBIndex) batchStorageDeclareSectors(ctx context.Context, declarations
 	return err
 }
 
-func (dbi *DBIndex) StorageDropSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType) error {
 
+func (dbi *DBIndex) StorageDropSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType) error {
 	if !dbi.checkFileType(ft) {
 		return xerrors.Errorf("invalid filetype")
 	}
 
-	_, err := dbi.harmonyDB.Exec(ctx,
-		"DELETE FROM sector_location WHERE miner_id=$1 and sector_num=$2 and sector_filetype=$3 and storage_id=$4",
-		int(s.Miner), int(s.Number), int(ft), string(storageID))
-	if err != nil {
-		return xerrors.Errorf("StorageDropSector DELETE query fails: %w", err)
+	var execErr error
+	retryWait := 100 * time.Millisecond
+
+	for attempt := 0; attempt < 5; attempt++ {
+		_, execErr = dbi.harmonyDB.Exec(ctx,
+			"DELETE FROM sector_location WHERE miner_id=$1 and sector_num=$2 and sector_filetype=$3 and storage_id=$4",
+			int(s.Miner), int(s.Number), int(ft), string(storageID))
+		if execErr == nil || !harmonydb.IsErrSerialization(execErr) {
+			break
+		}
+
+		log.Warnw("Retrying StorageDropSector due to serialization error",
+			"miner", s.Miner,
+			"sector", s.Number,
+			"fileType", ft,
+			"storage", storageID,
+			"attempt", attempt+1,
+			"err", execErr.Error())
+
+		time.Sleep(retryWait)
+		retryWait *= 2
+	}
+
+	if execErr != nil {
+		return xerrors.Errorf("StorageDropSector DELETE query fails after retries: %w", execErr)
 	}
 
 	return nil
 }
+
+// StorageFindSectors fetches storage info for multiple sectors at once.
+// This is much faster than calling StorageFindSector in a loop.
+func (dbi *DBIndex) StorageFindSectors(
+	ctx context.Context,
+	sectors []abi.SectorID,
+	ft storiface.SectorFileType,
+	ssize abi.SectorSize,
+	allowFetch bool,
+) (map[abi.SectorID][]storiface.SectorStorageInfo, error) {
+
+	result := make(map[abi.SectorID][]storiface.SectorStorageInfo)
+
+	if len(sectors) == 0 {
+		return result, nil
+	}
+
+	// Convert to arrays for query
+	miners := make([]uint64, len(sectors))
+	numbers := make([]uint64, len(sectors))
+	for i, s := range sectors {
+		miners[i] = uint64(s.Miner)
+		numbers[i] = uint64(s.Number)
+	}
+
+	fts := ft.AllSet()
+
+	// Query all sectors in one shot
+	type dbRes struct {
+		MinerId    uint64
+		SectorNum  uint64
+		StorageId  string
+		IsPrimary  bool
+		Urls       string
+		Weight     uint64
+		CanSeal    bool
+		CanStore   bool
+		Groups     string
+		AllowTo    string
+		AllowTypes string
+		DenyTypes  string
+		Count      uint64
+	}
+
+	var rows []dbRes
+	err := dbi.harmonyDB.Select(ctx, &rows,
+		`SELECT DISTINCT ON (sec.miner_id, sec.sector_num, stor.storage_id)
+			  sec.miner_id,
+			  sec.sector_num,
+			  stor.storage_id,
+			  BOOL_OR(is_primary) OVER(PARTITION BY sec.miner_id, sec.sector_num, stor.storage_id) AS is_primary,
+			  COUNT(*) OVER(PARTITION BY sec.miner_id, sec.sector_num, stor.storage_id) as count,
+			  urls,
+			  weight,
+			  can_seal,
+			  can_store,
+			  groups,
+			  allow_to,
+			  allow_types,
+			  deny_types
+		 FROM sector_location sec
+		 JOIN storage_path stor ON sec.storage_id = stor.storage_id 
+		 WHERE sec.miner_id = ANY($1)
+		   AND sec.sector_num = ANY($2)
+		   AND sec.sector_filetype = ANY($3)
+		 ORDER BY sec.miner_id, sec.sector_num, stor.storage_id`,
+		miners, numbers, fts)
+	if err != nil {
+		return nil, xerrors.Errorf("Finding multiple sector storage from DB fails: %w", err)
+	}
+
+	// Build results
+	for _, row := range rows {
+		s := abi.SectorID{Miner: abi.ActorID(row.MinerId), Number: abi.SectorNumber(row.SectorNum)}
+
+		// Parse URLs
+		var urls, burls []string
+		for _, u := range splitString(row.Urls) {
+			rl, err := url.Parse(u)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to parse url: %w", err)
+			}
+			rl.Path = gopath.Join(rl.Path, ft.String(), storiface.SectorName(s))
+			urls = append(urls, rl.String())
+			burls = append(burls, u)
+		}
+
+		result[s] = append(result[s], storiface.SectorStorageInfo{
+			ID:         storiface.ID(row.StorageId),
+			URLs:       urls,
+			BaseURLs:   burls,
+			Weight:     row.Weight * row.Count,
+			CanSeal:    row.CanSeal,
+			CanStore:   row.CanStore,
+			Primary:    row.IsPrimary,
+			AllowTypes: splitString(row.AllowTypes),
+			DenyTypes:  splitString(row.DenyTypes),
+		})
+	}
+
+	// TODO: if allowFetch == true, you can add the same secondary query logic from StorageFindSector
+	// for "can fetch new storage paths". For now, this covers existing sector locations.
+
+	return result, nil
+}
+
 
 func (dbi *DBIndex) StorageFindSector(ctx context.Context, s abi.SectorID, ft storiface.SectorFileType, ssize abi.SectorSize, allowFetch bool) ([]storiface.SectorStorageInfo, error) {
 

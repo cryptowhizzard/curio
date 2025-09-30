@@ -222,7 +222,7 @@ func (w *WdPostRecoverDeclareTask) TypeDetails() harmonytask.TaskTypeDetails {
 		Name: "WdPostRecover",
 		Cost: resources.Resources{
 			Cpu: 1,
-			Gpu: 0,
+			Gpu: 2,
 			Ram: 128 << 20,
 		},
 		MaxFailures: 10,
@@ -267,7 +267,7 @@ func (w *WdPostRecoverDeclareTask) processHeadChange(ctx context.Context, revert
 		}
 
 		// declaring two deadlines ahead
-		declDeadline := (di.Index + 2) % di.WPoStPeriodDeadlines
+		declDeadline := (di.Index + 4) % di.WPoStPeriodDeadlines
 
 		pps := di.PeriodStart
 		if declDeadline != di.Index+2 {

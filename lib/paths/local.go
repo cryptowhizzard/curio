@@ -41,6 +41,7 @@ import (
 
 // time abow which a warn log will be emitted for slow PoSt reads
 var SlowPoStCheckThreshold = 45 * time.Second
+var LocalSinfoTTL = 30 * time.Second
 
 type LocalStorage interface {
 	GetStorage() (storiface.StorageConfig, error)
@@ -112,6 +113,8 @@ type path struct {
 	Reservations map[string]int64
 
 	CanSeal bool
+	lastSinfoTime time.Time
+	lastSinfo     *storiface.StorageInfo
 }
 
 // statExistingSectorForReservation is optional parameter for stat method
@@ -823,7 +826,18 @@ func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, exi
 		// we use stable sort to preferentially sort it by write workload also
 		// least active storage first
 		sort.SliceStable(sis, func(i, j int) bool {
-			return activeReservations[i] < activeReservations[j]
+			//return activeReservations[i] < activeReservations[j]
+    pi := st.paths[sis[i].ID]
+    pj := st.paths[sis[j].ID]
+
+    // Prefer local paths first
+    if (pi.Local != "") != (pj.Local != "") {
+        return pi.Local != ""
+    }
+
+    // Fallback: fewer active reservations
+    return activeReservations[i] < activeReservations[j]
+
 		})
 
 		for _, si := range sis {
@@ -858,10 +872,17 @@ func (st *Local) Local(ctx context.Context) ([]storiface.StoragePath, error) {
 		if p.Local == "" {
 			continue
 		}
-
-		si, err := st.index.StorageInfo(ctx, id)
-		if err != nil {
-			return nil, xerrors.Errorf("get storage info for %s: %w", id, err)
+                var si storiface.StorageInfo
+                if p.lastSinfo == nil || time.Now().Sub(p.lastSinfoTime) > LocalSinfoTTL {
+                        var err error
+                        si, err = st.index.StorageInfo(ctx, id)
+                        if err != nil {
+                                return nil, xerrors.Errorf("get storage info for %s: %w", id, err)
+                        }
+                        p.lastSinfoTime = time.Now()
+                        p.lastSinfo = &si
+                } else {
+                        si = *p.lastSinfo
 		}
 
 		out = append(out, storiface.StoragePath{
